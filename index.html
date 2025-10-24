@@ -89,7 +89,15 @@
         </div>
         <canvas id="gameCanvas" width="800" height="400"></canvas>
         <div class="controls">
-            <p>Player: W/S keys | Computer: Arrow Up/Down keys</p>
+            <label>Mode:
+                <select id="modeSelect">
+                    <option value="single">Single Player</option>
+                    <option value="two" selected>Two Player</option>
+                    <option value="chaos">3-Ball Chaos</option>
+                </select>
+            </label>
+            <p>Player 1: W/S (Charge: C)</p>
+            <p>Player 2: Arrow Up/Down (Charge: M) — Two Player only</p>
             <p>Press SPACE to start/pause</p>
         </div>
         <div class="game-over" id="gameOver">
@@ -105,6 +113,13 @@
         const computerScoreElement = document.getElementById('computerScore');
         const gameOverElement = document.getElementById('gameOver');
         const winnerTextElement = document.getElementById('winnerText');
+        const modeSelect = document.getElementById('modeSelect');
+
+        // Mode/state
+        let mode = modeSelect.value; // 'single' | 'two'
+        modeSelect.addEventListener('change', () => {
+            mode = modeSelect.value;
+        });
 
         // Game state
         let gameRunning = false;
@@ -112,23 +127,59 @@
         let playerScore = 0;
         let computerScore = 0;
         const maxScore = 5;
+        let frameCount = 0;
+
+        // Power-ups / world state
+        const POWERUP_TYPES = ['big','small','sticky','multiBall','curve','invert','portals'];
+        const POWERUP_COLORS = {
+            big: '#4CAF50',
+            small: '#E91E63',
+            sticky: '#FFC107',
+            multiBall: '#00BCD4',
+            curve: '#9C27B0',
+            invert: '#FF5722',
+            portals: '#3F51B5'
+        };
+        const MAX_BALL_SPEED = 12;
+        let balls = [];
+        let activePickup = null; // {x,y,radius,type}
+        let powerupSpawnTimer = 240; // frames
+        let portals = null; // {a:{x,y,radius}, b:{x,y,radius}, expiresFrame}
+        let chaosRespawnTimer = 0; // frames until next chaos ball spawn
 
         // Game objects
-        const ball = {
-            x: canvas.width / 2,
-            y: canvas.height / 2,
-            dx: 4,
-            dy: 4,
-            radius: 8,
-            speed: 4
-        };
+        function createBall(x, y, dx, dy) {
+            return {
+                x: x,
+                y: y,
+                dx: dx,
+                dy: dy,
+                radius: 8,
+                speed: Math.hypot(dx, dy),
+                lastHit: null,
+                stuckTo: null,
+                releaseAt: 0,
+                curveUntil: 0,
+                curveSign: 0,
+                portalCooldown: 0
+            };
+        }
 
         const playerPaddle = {
             x: 20,
             y: canvas.height / 2 - 50,
             width: 15,
             height: 100,
-            speed: 5
+            speed: 5,
+            baseHeight: 100,
+            heightMultiplier: 1,
+            sizeUntil: 0,
+            stickyReady: false,
+            invertUntil: 0,
+            curveReady: false,
+            charging: false,
+            chargeStart: 0,
+            chargePower: 0
         };
 
         const computerPaddle = {
@@ -136,7 +187,16 @@
             y: canvas.height / 2 - 50,
             width: 15,
             height: 100,
-            speed: 4
+            speed: 4,
+            baseHeight: 100,
+            heightMultiplier: 1,
+            sizeUntil: 0,
+            stickyReady: false,
+            invertUntil: 0,
+            curveReady: false,
+            charging: false,
+            chargeStart: 0,
+            chargePower: 0
         };
 
         // Input handling
@@ -152,15 +212,37 @@
                     togglePause();
                 }
             }
+            // Charge keys
+            if (e.key === 'c' || e.key === 'C') {
+                if (!playerPaddle.charging) {
+                    playerPaddle.charging = true;
+                    playerPaddle.chargeStart = frameCount;
+                }
+            }
+            if (e.key === 'm' || e.key === 'M') {
+                if (mode === 'two' && !computerPaddle.charging) {
+                    computerPaddle.charging = true;
+                    computerPaddle.chargeStart = frameCount;
+                }
+            }
         });
 
         document.addEventListener('keyup', (e) => {
             keys[e.key] = false;
+            if (e.key === 'c' || e.key === 'C') {
+                playerPaddle.charging = false;
+                playerPaddle.chargePower = Math.min(1, (frameCount - playerPaddle.chargeStart) / 90);
+            }
+            if (e.key === 'm' || e.key === 'M') {
+                computerPaddle.charging = false;
+                computerPaddle.chargePower = Math.min(1, (frameCount - computerPaddle.chargeStart) / 90);
+            }
         });
 
         function startGame() {
             gameRunning = true;
             gamePaused = false;
+            balls = [];
             resetBall();
             gameLoop();
         }
@@ -181,10 +263,23 @@
         }
 
         function resetBall() {
-            ball.x = canvas.width / 2;
-            ball.y = canvas.height / 2;
-            ball.dx = (Math.random() > 0.5 ? 1 : -1) * ball.speed;
-            ball.dy = (Math.random() - 0.5) * ball.speed * 2;
+            balls.length = 0;
+            const isChaos = mode === 'chaos';
+            const numBalls = isChaos ? 3 : 1;
+            
+            for (let i = 0; i < numBalls; i++) {
+                const dirX = Math.random() > 0.5 ? 1 : -1;
+                const spd = 4;
+                const angle = (Math.random() - 0.5) * 0.8;
+                const dx = Math.cos(angle) * spd * dirX;
+                const dy = Math.sin(angle) * spd;
+                
+                // Offset y position slightly for multiple balls in chaos mode
+                const yOffset = isChaos ? (i - 1) * 40 : 0;
+                const startY = canvas.height / 2 + yOffset;
+                
+                balls.push(createBall(canvas.width / 2, startY, dx, dy));
+            }
         }
 
         function updateScore() {
@@ -199,63 +294,310 @@
                    circle.y - circle.radius < rect.y + rect.height;
         }
 
+        function setPaddleSize(paddle, multiplier) {
+            paddle.heightMultiplier = multiplier;
+            const oldHeight = paddle.height;
+            paddle.height = paddle.baseHeight * multiplier;
+            // Adjust y position to keep paddle centered and within bounds
+            const heightDiff = paddle.height - oldHeight;
+            paddle.y -= heightDiff / 2;
+            paddle.y = Math.max(0, Math.min(canvas.height - paddle.height, paddle.y));
+        }
+
+        function spawnPickup() {
+            const margin = 60;
+            const x = margin + Math.random() * (canvas.width - margin * 2);
+            const y = margin + Math.random() * (canvas.height - margin * 2);
+            const type = POWERUP_TYPES[Math.floor(Math.random() * POWERUP_TYPES.length)];
+            activePickup = { x: x, y: y, radius: 10, type: type };
+        }
+
+        function applyPowerup(owner, opponent, type) {
+            const DURATION = 480; // 8s at 60fps
+            if (type === 'big') {
+                owner.sizeUntil = frameCount + DURATION;
+                setPaddleSize(owner, 1.6);
+            } else if (type === 'small') {
+                opponent.sizeUntil = frameCount + DURATION;
+                setPaddleSize(opponent, 0.6);
+            } else if (type === 'sticky') {
+                owner.stickyReady = true;
+            } else if (type === 'multiBall') {
+                if (balls.length < 3 && balls.length > 0) {
+                    const base = balls[0];
+                    const sp = Math.max(4, base.speed);
+                    balls.push(createBall(base.x, base.y, -base.dx * 0.9, base.dy * 1.1));
+                    balls.push(createBall(base.x, base.y, base.dx * 1.1, -base.dy * 0.9));
+                }
+            } else if (type === 'curve') {
+                owner.curveReady = true;
+            } else if (type === 'invert') {
+                opponent.invertUntil = frameCount + DURATION;
+            } else if (type === 'portals') {
+                const r = 18;
+                const ax = canvas.width * 0.25;
+                const ay = 60 + Math.random() * (canvas.height - 120);
+                const bx = canvas.width * 0.75;
+                const by = 60 + Math.random() * (canvas.height - 120);
+                portals = {
+                    a: { x: ax, y: ay, radius: r },
+                    b: { x: bx, y: by, radius: r },
+                    expiresFrame: frameCount + 600
+                };
+            }
+        }
+
+        function stickBallToPaddle(ball, paddle, isLeft) {
+            ball.stuckTo = paddle;
+            ball.dx = 0;
+            ball.dy = 0;
+            ball.releaseAt = frameCount + 60;
+            // Position ball at paddle face
+            if (isLeft) {
+                ball.x = paddle.x + paddle.width + ball.radius + 1;
+            } else {
+                ball.x = paddle.x - ball.radius - 1;
+            }
+            ball.y = Math.min(Math.max(paddle.y + paddle.height / 2, ball.radius), canvas.height - ball.radius);
+        }
+
+        function releaseStuckBall(ball, isLeft, paddle) {
+            const baseSpeed = 5 + 5 * (paddle.chargePower || 0);
+            const dir = isLeft ? 1 : -1;
+            const aimDy = (keys['w'] || keys['W'] ? -1 : 0) + (keys['s'] || keys['S'] ? 1 : 0);
+            ball.dx = dir * baseSpeed;
+            ball.dy = aimDy !== 0 ? aimDy * baseSpeed * 0.6 : (Math.random() - 0.5) * baseSpeed * 0.6;
+            ball.speed = Math.min(MAX_BALL_SPEED, Math.hypot(ball.dx, ball.dy));
+            ball.stuckTo = null;
+            ball.releaseAt = 0;
+            paddle.stickyReady = false;
+            paddle.chargePower = 0;
+        }
+
+        function handlePaddleBallCollision(paddleName, paddle, ball) {
+            const isLeft = paddleName === 'player';
+            // Reflect
+            ball.dx = -ball.dx;
+            const hitCenter = paddle.y + paddle.height / 2;
+            const hitPos = (ball.y - hitCenter) / (paddle.height / 2);
+            ball.dy = hitPos * Math.max(4, Math.abs(ball.dx));
+            ball.speed = Math.min(MAX_BALL_SPEED, Math.hypot(ball.dx, ball.dy));
+            ball.lastHit = paddleName;
+
+            // Charge shot boost
+            if (paddle.chargePower > 0) {
+                const boost = 1 + 1.5 * paddle.chargePower;
+                ball.dx *= boost;
+                ball.dy *= boost;
+                ball.speed = Math.min(MAX_BALL_SPEED, Math.hypot(ball.dx, ball.dy));
+                paddle.chargePower = 0;
+            }
+
+            // Sticky capture
+            if (paddle.stickyReady) {
+                stickBallToPaddle(ball, paddle, isLeft);
+                return;
+            }
+
+            // Curve effect
+            if (paddle.curveReady) {
+                ball.curveUntil = frameCount + 240;
+                const movingUp = (isLeft ? (keys['w'] || keys['W']) : (mode === 'two' ? keys['ArrowUp'] : false));
+                const movingDown = (isLeft ? (keys['s'] || keys['S']) : (mode === 'two' ? keys['ArrowDown'] : false));
+                ball.curveSign = movingUp ? -1 : (movingDown ? 1 : (Math.random() < 0.5 ? -1 : 1));
+                paddle.curveReady = false;
+            }
+        }
+
         function update() {
-            if (gamePaused) return;
+            if (gamePaused || !gameRunning) return;
+            frameCount++;
 
             // Player paddle movement
-            if (keys['w'] || keys['W']) {
-                playerPaddle.y = Math.max(0, playerPaddle.y - playerPaddle.speed);
-            }
-            if (keys['s'] || keys['S']) {
-                playerPaddle.y = Math.min(canvas.height - playerPaddle.height, playerPaddle.y + playerPaddle.speed);
+            const invertPlayer = playerPaddle.invertUntil > frameCount;
+            const upPressedP1 = keys['w'] || keys['W'];
+            const downPressedP1 = keys['s'] || keys['S'];
+            const moveDirP1 = (upPressedP1 ? -1 : 0) + (downPressedP1 ? 1 : 0);
+            const finalDirP1 = invertPlayer ? -moveDirP1 : moveDirP1;
+            if (finalDirP1 !== 0) {
+                playerPaddle.y = Math.max(0, Math.min(canvas.height - playerPaddle.height, playerPaddle.y + finalDirP1 * playerPaddle.speed));
             }
 
             // Computer paddle movement
-            if (keys['ArrowUp']) {
-                computerPaddle.y = Math.max(0, computerPaddle.y - computerPaddle.speed);
-            }
-            if (keys['ArrowDown']) {
-                computerPaddle.y = Math.min(canvas.height - computerPaddle.height, computerPaddle.y + computerPaddle.speed);
+            if (mode === 'two') {
+                const invertComp = computerPaddle.invertUntil > frameCount;
+                const moveDirP2 = (keys['ArrowUp'] ? -1 : 0) + (keys['ArrowDown'] ? 1 : 0);
+                const finalDirP2 = invertComp ? -moveDirP2 : moveDirP2;
+                if (finalDirP2 !== 0) {
+                    computerPaddle.y = Math.max(0, Math.min(canvas.height - computerPaddle.height, computerPaddle.y + finalDirP2 * computerPaddle.speed));
+                }
+            } else {
+                // Simple AI: track closest threatening ball (heading towards AI); else closest
+                let targetBall = null;
+                let bestScore = Infinity;
+                for (let i = 0; i < balls.length; i++) {
+                    const b = balls[i];
+                    // Strongly prefer balls heading towards AI
+                    const threatBonus = b.dx > 0 ? 0 : 200;
+                    // Distance-based scoring
+                    const distScore = Math.abs((computerPaddle.y + computerPaddle.height / 2) - b.y);
+                    // In chaos mode, also consider x distance
+                    const xFactor = mode === 'chaos' ? Math.max(0, canvas.width - b.x) * 0.3 : 0;
+                    const s = distScore + threatBonus + xFactor;
+                    if (s < bestScore) { bestScore = s; targetBall = b; }
+                }
+                if (targetBall) {
+                    const center = computerPaddle.y + computerPaddle.height / 2;
+                    const diff = targetBall.y - center;
+                    const threshold = 5; // dead zone
+                    let dir = 0;
+                    if (Math.abs(diff) > threshold) {
+                        dir = diff < 0 ? -1 : 1;
+                    }
+                    const invertAI = computerPaddle.invertUntil > frameCount;
+                    const aiDir = invertAI ? -dir : dir;
+                    if (aiDir !== 0) {
+                        computerPaddle.y = Math.max(0, Math.min(canvas.height - computerPaddle.height, computerPaddle.y + aiDir * computerPaddle.speed * 0.9));
+                    }
+                }
             }
 
-            // Ball movement
-            ball.x += ball.dx;
-            ball.y += ball.dy;
+            // Keep paddles within bounds
+            playerPaddle.y = Math.max(0, Math.min(canvas.height - playerPaddle.height, playerPaddle.y));
+            computerPaddle.y = Math.max(0, Math.min(canvas.height - computerPaddle.height, computerPaddle.y));
+
+            // Restore paddle sizes after duration
+            if (playerPaddle.sizeUntil > 0 && frameCount > playerPaddle.sizeUntil) { 
+                setPaddleSize(playerPaddle, 1); 
+                playerPaddle.sizeUntil = 0; 
+            }
+            if (computerPaddle.sizeUntil > 0 && frameCount > computerPaddle.sizeUntil) { 
+                setPaddleSize(computerPaddle, 1); 
+                computerPaddle.sizeUntil = 0; 
+            }
+
+            // Spawn pickups
+            if (!activePickup) {
+                powerupSpawnTimer--;
+                if (powerupSpawnTimer <= 0) {
+                    spawnPickup();
+                    powerupSpawnTimer = 360 + Math.floor(Math.random() * 240);
+                }
+            }
+
+            // Expire portals
+            if (portals && frameCount > portals.expiresFrame) {
+                portals = null;
+            }
+
+            // Ball movement and interactions
+            for (let i = balls.length - 1; i >= 0; i--) {
+                const b = balls[i];
+
+                // Release stuck balls
+                if (b.stuckTo) {
+                    const isLeft = b.stuckTo === playerPaddle;
+                    // follow paddle
+                    if (isLeft) {
+                        b.x = b.stuckTo.x + b.stuckTo.width + b.radius + 1;
+                    } else {
+                        b.x = b.stuckTo.x - b.radius - 1;
+                    }
+                    b.y = Math.min(Math.max(b.stuckTo.y + b.stuckTo.height / 2, b.radius), canvas.height - b.radius);
+                    // release on time or on charge key release
+                    const releaseKey = isLeft ? !(keys['c'] || keys['C']) : !(keys['m'] || keys['M']);
+                    if (frameCount >= b.releaseAt || releaseKey) {
+                        releaseStuckBall(b, isLeft, b.stuckTo);
+                    }
+                    continue;
+                }
+
+                // Move
+                b.x += b.dx;
+                b.y += b.dy;
+                if (b.portalCooldown > 0) b.portalCooldown--;
+
+                // Apply curve
+                if (b.curveUntil > frameCount) {
+                    b.dy += 0.08 * b.curveSign;
+                }
 
             // Ball collision with top and bottom walls
-            if (ball.y - ball.radius <= 0 || ball.y + ball.radius >= canvas.height) {
-                ball.dy = -ball.dy;
-            }
+                if (b.y - b.radius <= 0 || b.y + b.radius >= canvas.height) {
+                    b.dy = -b.dy;
+                }
 
             // Ball collision with paddles
-            if (checkCollision(playerPaddle, ball) && ball.dx < 0) {
-                ball.dx = -ball.dx;
-                // Add some spin based on where the ball hits the paddle
-                const hitPos = (ball.y - (playerPaddle.y + playerPaddle.height / 2)) / (playerPaddle.height / 2);
-                ball.dy = hitPos * ball.speed;
-            }
-
-            if (checkCollision(computerPaddle, ball) && ball.dx > 0) {
-                ball.dx = -ball.dx;
-                // Add some spin based on where the ball hits the paddle
-                const hitPos = (ball.y - (computerPaddle.y + computerPaddle.height / 2)) / (computerPaddle.height / 2);
-                ball.dy = hitPos * ball.speed;
-            }
+                if (checkCollision(playerPaddle, b) && b.dx < 0) {
+                    handlePaddleBallCollision('player', playerPaddle, b);
+                }
+                if (checkCollision(computerPaddle, b) && b.dx > 0) {
+                    handlePaddleBallCollision('computer', computerPaddle, b);
+                }
 
             // Scoring
-            if (ball.x < 0) {
-                computerScore++;
-                updateScore();
-                resetBall();
-                if (computerScore >= maxScore) {
-                    endGame('Computer Wins!');
+                if (b.x < -b.radius) {
+                    computerScore++;
+                    updateScore();
+                    balls.splice(i, 1);
+                    if (computerScore >= maxScore) { 
+                        endGame('Right Side Wins!'); 
+                    }
+                    continue; // Skip to next ball
+                } else if (b.x > canvas.width + b.radius) {
+                    playerScore++;
+                    updateScore();
+                    balls.splice(i, 1);
+                    if (playerScore >= maxScore) { 
+                        endGame('Left Side Wins!'); 
+                    }
+                    continue; // Skip to next ball
                 }
-            } else if (ball.x > canvas.width) {
-                playerScore++;
-                updateScore();
+
+                // Pickups collection by balls
+                if (activePickup) {
+                    const dxp = b.x - activePickup.x;
+                    const dyp = b.y - activePickup.y;
+                    const dist = Math.sqrt(dxp * dxp + dyp * dyp);
+                    if (dist <= (b.radius + activePickup.radius)) {
+                        const owner = (b.lastHit === 'player') ? playerPaddle : (b.lastHit === 'computer' ? computerPaddle : (b.dx > 0 ? playerPaddle : computerPaddle));
+                        const opponent = owner === playerPaddle ? computerPaddle : playerPaddle;
+                        applyPowerup(owner, opponent, activePickup.type);
+                        activePickup = null;
+                    }
+                }
+
+                // Portals
+                if (portals && b.portalCooldown === 0) {
+                    const inA = Math.hypot(b.x - portals.a.x, b.y - portals.a.y) <= portals.a.radius;
+                    const inB = Math.hypot(b.x - portals.b.x, b.y - portals.b.y) <= portals.b.radius;
+                    if (inA || inB) {
+                        const src = inA ? portals.a : portals.b;
+                        const dst = inA ? portals.b : portals.a;
+                        const angle = Math.atan2(b.dy, b.dx);
+                        b.x = dst.x + Math.cos(angle) * (dst.radius + b.radius + 2);
+                        b.y = dst.y + Math.sin(angle) * (dst.radius + b.radius + 2);
+                        b.portalCooldown = 20;
+                    }
+                }
+            }
+
+            // Ensure at least one ball exists, or maintain 3 in chaos mode
+            if (balls.length === 0) {
                 resetBall();
-                if (playerScore >= maxScore) {
-                    endGame('Player Wins!');
+                chaosRespawnTimer = 0;
+            } else if (mode === 'chaos' && balls.length < 3) {
+                // Respawn balls in chaos mode to maintain 3
+                if (chaosRespawnTimer <= 0) {
+                    const dirX = Math.random() > 0.5 ? 1 : -1;
+                    const spd = 4;
+                    const angle = (Math.random() - 0.5) * 0.8;
+                    const dx = Math.cos(angle) * spd * dirX;
+                    const dy = Math.sin(angle) * spd;
+                    balls.push(createBall(canvas.width / 2, canvas.height / 2, dx, dy));
+                    chaosRespawnTimer = 60; // 1 second delay before next spawn
+                } else {
+                    chaosRespawnTimer--;
                 }
             }
         }
@@ -275,16 +617,58 @@
             ctx.stroke();
             ctx.setLineDash([]);
 
-            // Draw ball
+            // Draw balls
             ctx.fillStyle = '#fff';
-            ctx.beginPath();
-            ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
-            ctx.fill();
+            for (let i = 0; i < balls.length; i++) {
+                const b = balls[i];
+                ctx.beginPath();
+                ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+                ctx.fill();
+            }
 
             // Draw paddles
             ctx.fillStyle = '#fff';
             ctx.fillRect(playerPaddle.x, playerPaddle.y, playerPaddle.width, playerPaddle.height);
             ctx.fillRect(computerPaddle.x, computerPaddle.y, computerPaddle.width, computerPaddle.height);
+
+            // Draw pickup
+            if (activePickup) {
+                ctx.fillStyle = POWERUP_COLORS[activePickup.type] || '#fff';
+                ctx.beginPath();
+                ctx.arc(activePickup.x, activePickup.y, activePickup.radius, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Draw portals
+            if (portals) {
+                ctx.strokeStyle = '#3F51B5';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.arc(portals.a.x, portals.a.y, portals.a.radius, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(portals.b.x, portals.b.y, portals.b.radius, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+
+            // Ability indicators
+            function drawBadge(x, y, text) {
+                ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                ctx.fillRect(x, y - 16, 28, 16);
+                ctx.fillStyle = '#fff';
+                ctx.font = '12px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(text, x + 14, y - 4);
+                ctx.textAlign = 'left';
+            }
+            if (playerPaddle.stickyReady) drawBadge(playerPaddle.x, playerPaddle.y, 'S');
+            if (playerPaddle.curveReady) drawBadge(playerPaddle.x + 30, playerPaddle.y, 'C');
+            if (playerPaddle.invertUntil > frameCount) drawBadge(playerPaddle.x + 60, playerPaddle.y, 'I');
+            if (playerPaddle.sizeUntil > frameCount) drawBadge(playerPaddle.x + 90, playerPaddle.y, 'B');
+            if (computerPaddle.stickyReady) drawBadge(computerPaddle.x - 30, computerPaddle.y, 'S');
+            if (computerPaddle.curveReady) drawBadge(computerPaddle.x - 60, computerPaddle.y, 'C');
+            if (computerPaddle.invertUntil > frameCount) drawBadge(computerPaddle.x - 90, computerPaddle.y, 'I');
+            if (computerPaddle.sizeUntil > frameCount) drawBadge(computerPaddle.x - 120, computerPaddle.y, 'B');
 
             // Draw pause message
             if (gamePaused) {
@@ -307,10 +691,15 @@
         function gameLoop() {
             if (!gameRunning) return;
             
-            update();
-            draw();
+            try {
+                update();
+                draw();
+            } catch (error) {
+                console.error('Game loop error:', error);
+                // Continue anyway to prevent game from stopping
+            }
             
-            if (!gamePaused) {
+            if (!gamePaused && gameRunning) {
                 requestAnimationFrame(gameLoop);
             }
         }
